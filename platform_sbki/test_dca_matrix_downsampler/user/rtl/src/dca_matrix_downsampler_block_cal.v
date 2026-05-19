@@ -186,47 +186,85 @@ generate
         localparam integer BIT10 = GET_MATRIX_INDEX((IN_R0+1), IN_C0);
         localparam integer BIT11 = GET_MATRIX_INDEX((IN_R0+1), (IN_C0+1));
 
+        // extract 2x2 input elements
         wire [BW_TENSOR_SCALAR-1:0] a00_u = mreg0_all_rdata_list2d[BIT00-:BW_TENSOR_SCALAR];
         wire [BW_TENSOR_SCALAR-1:0] a01_u = mreg0_all_rdata_list2d[BIT01-:BW_TENSOR_SCALAR];
         wire [BW_TENSOR_SCALAR-1:0] a10_u = mreg0_all_rdata_list2d[BIT10-:BW_TENSOR_SCALAR];
         wire [BW_TENSOR_SCALAR-1:0] a11_u = mreg0_all_rdata_list2d[BIT11-:BW_TENSOR_SCALAR];
 
-        wire signed [BW_TENSOR_SCALAR-1:0] a00 = $signed(a00_u);
-        wire signed [BW_TENSOR_SCALAR-1:0] a01 = $signed(a01_u);
-        wire signed [BW_TENSOR_SCALAR-1:0] a10 = $signed(a10_u);
-        wire signed [BW_TENSOR_SCALAR-1:0] a11 = $signed(a11_u);
-
-        // max
-        wire signed [BW_TENSOR_SCALAR-1:0] max01 = (a00 > a01) ? a00 : a01;
-        wire signed [BW_TENSOR_SCALAR-1:0] max23 = (a10 > a11) ? a10 : a11;
-        wire signed [BW_TENSOR_SCALAR-1:0] maxv  = (max01 > max23) ? max01 : max23;
-
-        // sum/avg (sign-extend then add)
+        // sign-extend all inputs to accumulator width
         wire signed [BW_TENSOR_SCALAR_ACC-1:0] sx00 =
-          {{(BW_TENSOR_SCALAR_ACC-BW_TENSOR_SCALAR){a00[BW_TENSOR_SCALAR-1]}}, a00};
+          {{BW_TENSOR_SCALAR_ACC_EXTRA{a00_u[BW_TENSOR_SCALAR-1]}}, a00_u};
         wire signed [BW_TENSOR_SCALAR_ACC-1:0] sx01 =
-          {{(BW_TENSOR_SCALAR_ACC-BW_TENSOR_SCALAR){a01[BW_TENSOR_SCALAR-1]}}, a01};
+          {{BW_TENSOR_SCALAR_ACC_EXTRA{a01_u[BW_TENSOR_SCALAR-1]}}, a01_u};
         wire signed [BW_TENSOR_SCALAR_ACC-1:0] sx10 =
-          {{(BW_TENSOR_SCALAR_ACC-BW_TENSOR_SCALAR){a10[BW_TENSOR_SCALAR-1]}}, a10};
+          {{BW_TENSOR_SCALAR_ACC_EXTRA{a10_u[BW_TENSOR_SCALAR-1]}}, a10_u};
         wire signed [BW_TENSOR_SCALAR_ACC-1:0] sx11 =
-          {{(BW_TENSOR_SCALAR_ACC-BW_TENSOR_SCALAR){a11[BW_TENSOR_SCALAR-1]}}, a11};
+          {{BW_TENSOR_SCALAR_ACC_EXTRA{a11_u[BW_TENSOR_SCALAR-1]}}, a11_u};
 
-        wire signed [BW_TENSOR_SCALAR_ACC-1:0] sumv = sx00 + sx01 + sx10 + sx11;
+        // shared ALU control:
+        //   do_sub  = 1 for max (subtract to compare via sign bit)
+        //   is_pass = 1 for topleft (bypass ALU, pass left operand)
+        wire do_sub  = opcode_max;
+        wire is_pass = opcode_topleft;
 
-        wire neg_sumv = sumv[BW_TENSOR_SCALAR_ACC-1];
-        wire has_rem4 = |sumv[1:0];
+        //----------------------------------------------------------
+        // Stage 1, Node1: ALU(sx00, sx01)
+        //   unified add/sub form: a + (sub ? ~b : b) + sub
+        //   add mode  -> sx00 + sx01
+        //   sub mode  -> sx00 - sx01 (sign bit selects max)
+        //----------------------------------------------------------
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node1_alu =
+          sx00 + (do_sub ? ~sx01 : sx01) + do_sub;
+        wire node1_neg = node1_alu[BW_TENSOR_SCALAR_ACC-1];
 
-        wire signed [BW_TENSOR_SCALAR_ACC-1:0] sumv_adj =
-          (neg_sumv & has_rem4) ? (sumv + 3) : sumv;
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node1 =
+          is_pass ? sx00 :
+          do_sub  ? (node1_neg ? sx01 : sx00) :
+                    node1_alu;
 
-        wire signed [BW_TENSOR_SCALAR_ACC-1:0] avgv = (sumv_adj >>> 2);
+        //----------------------------------------------------------
+        // Stage 1, Node2: ALU(sx10, sx11)
+        //----------------------------------------------------------
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node2_alu =
+          sx10 + (do_sub ? ~sx11 : sx11) + do_sub;
+        wire node2_neg = node2_alu[BW_TENSOR_SCALAR_ACC-1];
 
-        // select output (assume only one opcode asserted)
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node2 =
+          is_pass ? sx10 :
+          do_sub  ? (node2_neg ? sx11 : sx10) :
+                    node2_alu;
+
+        //----------------------------------------------------------
+        // Stage 2, Node3: ALU(Node1, Node2)
+        //----------------------------------------------------------
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node3_alu =
+          node1 + (do_sub ? ~node2 : node2) + do_sub;
+        wire node3_neg = node3_alu[BW_TENSOR_SCALAR_ACC-1];
+
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node3 =
+          is_pass ? node1 :
+          do_sub  ? (node3_neg ? node2 : node1) :
+                    node3_alu;
+
+        //----------------------------------------------------------
+        // Post-processing: avg only
+        //   negative rounding correction (neg & rem) ? +3, then >>> 2
+        //----------------------------------------------------------
+        wire neg_node3 = node3[BW_TENSOR_SCALAR_ACC-1];
+        wire has_rem   = |node3[1:0];
+
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] node3_adj =
+          (neg_node3 & has_rem) ? (node3 + 3) : node3;
+
+        wire signed [BW_TENSOR_SCALAR_ACC-1:0] avgv = (node3_adj >>> 2);
+
+        // output selection:
+        //   avg    -> avgv truncated to BW_TENSOR_SCALAR
+        //   others -> node3 truncated (topleft=a00, max=maxval, sum=sumval)
         wire signed [BW_TENSOR_SCALAR-1:0] out_calc =
-          opcode_topleft ? a00 :
-          opcode_max     ? maxv :
-          opcode_sum     ? $signed(sumv[BW_TENSOR_SCALAR-1:0]) :
-          /*opcode_avg*/   $signed(avgv[BW_TENSOR_SCALAR-1:0]);
+          opcode_avg ? $signed(avgv[BW_TENSOR_SCALAR-1:0]) :
+                       $signed(node3[BW_TENSOR_SCALAR-1:0]);
 
         wire [BW_TENSOR_SCALAR-1:0] out_u =
           wen ? out_calc[BW_TENSOR_SCALAR-1:0] : {BW_TENSOR_SCALAR{1'b0}};

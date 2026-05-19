@@ -1,7 +1,7 @@
 
 `define USE_SRAM
-`define SRAM_HEX_SIZE 352
+`define SRAM_HEX_SIZE 368
 `define CRM_HEX_SIZE 0
 `define USE_DRAM
-`define DRAM_HEX_SIZE 21456
-`define HEX_SIZE 21456
+`define DRAM_HEX_SIZE 35888
+`define HEX_SIZE 35888
